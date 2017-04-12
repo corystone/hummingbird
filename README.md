@@ -42,7 +42,7 @@ environments later.
 1. Pick a path to install Go binaries, and extract them. The recommended
    location is `/usr/local`:
 
-        tar -C /usr/local -zxf go1.6.2.linux-amd64.tar.gz
+        tar -C /usr/local -xzf go1.8.1.linux-amd64.tar.gz
 
 1. Now, export three environment variables to inform both Go and your shell
    where to find what you'll need to run both Go and Hummingbird binaries.
@@ -68,7 +68,7 @@ environments later.
 1. Ensure you can now use the new `go` binary:
 
         $ go version
-        go version go1.6.2 linux/amd64
+        go version go1.8.1 linux/amd64
 
 
 Installing Hummingbird
@@ -78,19 +78,14 @@ Now we need to bring the Hummingbird codebase into our GOPATH. We already have
 Swift cloned in our SAIO, so it's easier for us to just symlink it into a
 folder structure within our GOPATH:
 
-    mkdir -p $GOPATH/src/github.com/openstack
-    ln -s ~/swift $GOPATH/src/github.com/openstack/swift
-
-Since Hummingbird work is ongoing in a feature branch, be sure you checkout the
-appropriate branch before attempting to install:
-
-    cd $GOPATH/src/github.com/openstack/swift
-    git checkout feature/hummingbird
+    mkdir -p $GOPATH/src/github.com/troubling
+    cd $GOPATH/src/github.com/troubling
+    git clone https://github.com/troubling/hummingbird.git
 
 Now you're ready to compile, test, and install Hummingbird. A Makefile is
 provided to make this simpler:
 
-    cd $GOPATH/src/github.com/openstack/swift/go
+    cd $GOPATH/src/github.com/troubling/hummingbird
     make get test all
 
 Once complete, your output will look similar like this:
@@ -127,6 +122,17 @@ Other than that, Hummingbird will continue using the same configuration files
 you already use for Swift processes today, and some `hummingbird` commands can
 be provided a specific configuration file to use.
 
+Edit /etc/swift/proxy-server.conf
+
+    [filter:copy]
+    use = egg:swift#copy
+    object_post_as_copy = true
+
+Edit /etc/swift/swift.conf (no erasure_coding policy type)
+
+    [storage-policy:2]
+    name = ec42
+    policy_type = replication
 
 Running
 -------
