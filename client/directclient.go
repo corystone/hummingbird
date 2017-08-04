@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/troubling/hummingbird/common"
@@ -778,25 +779,90 @@ func (p *putReader) Read(b []byte) (int, error) {
 	}
 }
 
+type quorumWorker struct {
+	index     int
+	dev       *ring.Device
+	more      ring.MoreNodes
+	f         func(int, *ring.Device, chan io.WriteCloser, chan *http.Response, chan struct{})
+	ready     bool
+	wg        *sync.WaitGroup
+	resp      *http.Response
+	writer    io.WriteCloser
+	responses chan *http.Response
+}
+
+func (qw *quorumWorker) work() {
+	fmt.Printf("Worker work!\n")
+	dev := qw.dev
+	ready := make(chan io.WriteCloser)
+	oneResponse := make(chan *http.Response)
+	cancel := make(chan struct{})
+	defer close(cancel)
+
+	for dev != nil {
+		fmt.Printf("Working on dev: %+v!\n", dev)
+		go qw.f(qw.index, dev, ready, oneResponse, cancel)
+		select {
+		case resp := <-oneResponse:
+			if resp.StatusCode >= 500 || resp.StatusCode < 0 {
+				fmt.Printf("resp: %+v\n", resp)
+				dev = qw.more.Next()
+				fmt.Printf("Moving to handoff: %+v\n", dev)
+			} else {
+			/* FIXME. Something like this */
+				fmt.Printf("Worker got response: %+v\n", resp)
+				qw.resp = resp
+				dev = nil
+				qw.dev = dev
+			}
+		case qw.writer = <-ready:
+			fmt.Printf("Ready for dev: %+v\n", dev)
+			dev = nil
+			qw.dev = dev
+		}
+	}
+
+	// FIXME. Only wait for PUTs
+	if qw.wg != nil {
+		qw.wg.Done()
+	}
+
+	responseTimeout := time.After(postPutTimeout)
+	if qw.writer != nil {
+		select {
+		case qw.resp = <-oneResponse:
+			qw.responses <- qw.resp
+		case <-responseTimeout:
+			fmt.Printf("This put timed out: %+v\n", qw.dev)
+		}
+	} else if qw.resp != nil {
+		qw.responses <- qw.resp
+	}
+}
+
 func (oc *standardObjectClient) putObject(obj string, headers http.Header, src io.Reader) *http.Response {
 	objectReplicaCount := int(oc.objectRing.ReplicaCount())
 	objectPartition := oc.objectRing.GetPartition(oc.account, oc.container, obj)
 	containerPartition := oc.proxyDirectClient.ContainerRing.GetPartition(oc.account, oc.container, "")
 	containerDevices := oc.proxyDirectClient.ContainerRing.GetNodes(containerPartition)
-	ready := make(chan io.WriteCloser)
-	cancel := make(chan struct{})
-	defer close(cancel)
-	responses := make(chan *respRec)
-	writers := make([]io.Writer, 0)
-	cWriters := make([]io.WriteCloser, 0)
-	q := newQuorumer(oc.objectRing, objectPartition, responses, cancel, func(index int, dev *ring.Device) *http.Response {
+	devs := oc.objectRing.GetNodes(objectPartition)
+	more := oc.objectRing.GetMoreNodes(objectPartition)
+
+	/*
+		responseClassCounts: make([]int, 6),
+		cancel:              cancel,
+		responsec:           responsec,
+	*/
+
+	makeRequest := func(index int, dev *ring.Device, ready chan io.WriteCloser, response chan *http.Response, cancel chan struct{}) {
 		trp, wp := io.Pipe()
 		rp := &putReader{Reader: trp, cancel: cancel, w: wp, ready: ready}
 		url := fmt.Sprintf("http://%s:%d/%s/%d/%s/%s/%s", dev.Ip, dev.Port, dev.Device, objectPartition,
 			common.Urlencode(oc.account), common.Urlencode(oc.container), common.Urlencode(obj))
 		req, err := http.NewRequest("PUT", url, rp)
 		if err != nil {
-			return ResponseStub(http.StatusInternalServerError, err.Error())
+			response <- ResponseStub(http.StatusInternalServerError, err.Error())
+			return
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 		for key := range headers {
@@ -808,34 +874,85 @@ func (oc *standardObjectClient) putObject(obj string, headers http.Header, src i
 		req.Header.Set("Expect", "100-Continue")
 		// requests that get a 100-continue will wait inside Do() until we have a quorum of writers
 		if r, err := oc.proxyDirectClient.client.Do(req); err != nil {
-			return ResponseStub(http.StatusInternalServerError, err.Error())
+			response <- ResponseStub(http.StatusInternalServerError, err.Error())
 		} else {
-			return StubResponse(r)
-		}
-	})
-	q.start()
-	for !q.quorumMet(len(writers)) {
-		if !q.launchUntilQuorumPossible() {
-			return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
-		}
-		select {
-		case response := <-responses:
-			q.addResponse(response.i, response.r)
-		case w := <-ready:
-			defer w.Close()
-			writers = append(writers, w)
-			cWriters = append(cWriters, w)
+			response <- StubResponse(r)
 		}
 	}
-	// TODO: get a Copy function that only errors if we can't complete a quorum of writers.  Or something.
-	if _, err := common.Copy(src, writers...); err != nil {
+
+	responses := make(chan *http.Response)
+	q := &stdQuorumer{
+		q:                   int(math.Ceil(float64(oc.objectRing.ReplicaCount()) / 2.0)),
+		replicaCount:        int(oc.objectRing.ReplicaCount()),
+		devs:                oc.objectRing.GetNodes(objectPartition),
+		more:                oc.objectRing.GetMoreNodes(objectPartition),
+		responseClassCounts: make([]int, 6),
+	}
+
+	workers := make([]*quorumWorker, 0)
+	var workerGroup sync.WaitGroup
+	for i, dev := range devs {
+		worker := &quorumWorker{index: i, dev: dev, more: more, f: makeRequest, wg: &workerGroup, responses: responses}
+		workers = append(workers, worker)
+		workerGroup.Add(1)
+		go worker.work()
+	}
+	workerGroup.Wait()
+
+	writers := make([]io.Writer, 0)
+	cWriters := make([]io.WriteCloser, 0)
+	numResponses := 0
+	for _, worker := range workers {
+		fmt.Printf("Worker done: %+v\n", worker)
+		if worker.writer != nil {
+			fmt.Printf("Worker HAS writer!\n")
+			writers = append(writers, worker.writer)
+			cWriters = append(cWriters, worker.writer)
+		} else if worker.resp != nil {
+			numResponses++
+		}
+	}
+
+	if numResponses + len(writers) < q.q {
 		return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
+	}
+
+	// TODO: get a Copy function that only errors if we can't complete a quorum of writers.  Or something.
+	if len(writers) > 0 {
+		if _, err := common.Copy(src, writers...); err != nil {
+			return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
+		}
 	}
 	for _, w := range cWriters {
 		w.Close()
 	}
-	// TODO: verify that response etags match
-	return q.getResponse(postPutTimeout)
+	getResponseTimeout := time.After(postPutTimeout)
+	for i := 0; i < numResponses + len(writers); i++ {
+		select {
+		case resp := <-responses:
+			q.addResponse(1, resp)
+			fmt.Printf("Got response, all responses: %+v\n", q.responses)
+			for _, r := range q.responses {
+				if q.responseClassCounts[r.StatusCode/100] >= q.q {
+					// Give pending requests a chance to finish, to improve consistency of read-after-write.
+					finalizeTimeout := time.After(PostQuorumTimeoutMs * time.Millisecond)
+					for len(writers) > len(q.responses) {
+						select {
+						case resp := <-responses:
+							q.addResponse(1, resp)
+						case <-finalizeTimeout:
+							return r
+						}
+					}
+					return r
+				}
+			}
+		case <-getResponseTimeout:
+			return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
+		}
+	}
+
+	return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
 }
 
 func (oc *standardObjectClient) postObject(obj string, headers http.Header) *http.Response {
