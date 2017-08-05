@@ -840,6 +840,7 @@ func (qw *quorumWorker) work() {
 		case qw.response = <-oneResponse:
 			qw.responses <- qw.response
 		case <-responseTimeout:
+			qw.writer.Close()
 			fmt.Printf("This put timed out: %+v\n", qw.dev)
 		}
 	} else if qw.response != nil {
