@@ -100,9 +100,9 @@ type respRec struct {
 type quorumer interface {
 	start()
 	addResponse(*http.Response)
-	addWriter(io.WriteCloser)
 	getResponse(time.Duration) *http.Response
-	listWriters() []io.WriteCloser
+	addWriter(io.WriteCloser)
+	getWriters() []io.WriteCloser
 	responseCount() int
 	getQ() int
 	cleanup()
@@ -116,10 +116,10 @@ func (p *putQuorumer) start() {
 	p.stdQuorumer.workers = make([]*quorumWorker, 0)
 	var workerGroup sync.WaitGroup
 	for i, dev := range p.stdQuorumer.devs {
-		worker := &quorumWorker{index: i, dev: dev, more: p.stdQuorumer.more, f: p.stdQuorumer.makeRequest, wg: &workerGroup, responsec: p.stdQuorumer.responsec, q: p.stdQuorumer}
+		worker := &quorumWorker{index: i, more: p.stdQuorumer.more, f: p.stdQuorumer.makeRequest, wg: &workerGroup, responsec: p.stdQuorumer.responsec, q: p.stdQuorumer}
 		workerGroup.Add(1)
 		p.stdQuorumer.workers = append(p.stdQuorumer.workers, worker)
-		go worker.work()
+		go worker.work(dev)
 	}
 	workerGroup.Wait()
 }
@@ -146,9 +146,9 @@ func (q *stdQuorumer) getQ() int {
 func (q *stdQuorumer) start() {
 	q.workers = make([]*quorumWorker, 0)
 	for i, dev := range q.devs {
-		worker := &quorumWorker{index: i, dev: dev, more: q.more, f: q.makeRequest, responsec: q.responsec, q: q}
+		worker := &quorumWorker{index: i, more: q.more, f: q.makeRequest, responsec: q.responsec, q: q}
 		q.workers = append(q.workers, worker)
-		go worker.work()
+		go worker.work(dev)
 	}
 }
 
@@ -165,10 +165,8 @@ func (q *stdQuorumer) addResponse(resp *http.Response) {
 }
 
 func (q *stdQuorumer) cleanup() {
-	fmt.Printf("quorumer cleanup. picking up after all the stragglers\n")
 	for len(q.responses) < len(q.workers) {
 		resp := <-q.responsec
-		fmt.Printf("Found a straggler!\n")
 		q.addResponse(resp)
 	}
 }
@@ -209,7 +207,6 @@ func (q *stdQuorumer) getResponse(timeout time.Duration) *http.Response {
 		if outstandingRequests > 0 {
 			select {
 			case response := <-q.responsec:
-				fmt.Printf("got response off responsec: %v\n", response)
 				q.addResponse(response)
 			case <-getResponseTimeout:
 				return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
@@ -229,7 +226,7 @@ func (q *stdQuorumer) responseCount() int {
 	return i
 }
 
-func (q *stdQuorumer) listWriters() []io.WriteCloser {
+func (q *stdQuorumer) getWriters() []io.WriteCloser {
 	return q.writers
 }
 
@@ -809,40 +806,35 @@ type quorumWorker struct {
 	q         quorumer
 }
 
-func (qw *quorumWorker) work() {
-	fmt.Printf("Worker work!\n")
-	dev := qw.dev
+func (qw *quorumWorker) work(dev *ring.Device) {
 	ready := make(chan io.WriteCloser)
 	oneResponse := make(chan *http.Response)
 	cancel := make(chan struct{})
 	defer close(cancel)
 
 	for dev != nil {
-		fmt.Printf("Working on dev: %+v!\n", dev)
 		responseTimeout := time.After(postPutTimeout)
 		go qw.f(qw.index, dev, oneResponse, ready, cancel)
 		select {
-		// FIXME. Timeout + cancel? Don't really want multiple goroutines trying to finish in the same worker.
 		case resp := <-oneResponse:
 			if resp.StatusCode >= 500 || resp.StatusCode < 0 {
-				fmt.Printf("resp: %+v\n", resp)
 				dev = qw.more.Next()
-				fmt.Printf("Moving to handoff: %+v\n", dev)
 			} else {
-				fmt.Printf("Worker got response: %+v\n", resp)
 				qw.response = resp
-				qw.dev = dev
 				dev = nil
 			}
 		case qw.writer = <-ready:
-			fmt.Printf("Ready for dev: %+v\n", dev)
 			qw.q.addWriter(qw.writer)
-			qw.dev = dev
 			dev = nil
+		case <-responseTimeout:
+			defer func() {
+				<-oneResponse
+			}()
+			// Need a new channel since the other one is busy
+			oneResponse = make(chan *http.Response)
 		}
 	}
 
-	// FIXME. Only wait for PUTs
 	if qw.wg != nil {
 		qw.wg.Done()
 	}
@@ -852,6 +844,7 @@ func (qw *quorumWorker) work() {
 		return
 	}
 
+	// Now wait for the rest of the PUT to finish.
 	responseTimeout := time.After(postPutTimeout)
 	if qw.writer != nil {
 		select {
@@ -859,7 +852,6 @@ func (qw *quorumWorker) work() {
 			qw.responsec <- qw.response
 			return
 		case <-responseTimeout:
-			fmt.Printf("This put timed out: %+v\n", qw.dev)
 			qw.writer.Close()
 			defer func() {
 				<-oneResponse
@@ -906,8 +898,7 @@ func (oc *standardObjectClient) putObject(obj string, headers http.Header, src i
 	q.start()
 	writers := make([]io.Writer, 0)
 	cWriters := make([]io.WriteCloser, 0)
-	for _, w := range q.listWriters() {
-		fmt.Printf("HAS writer!\n")
+	for _, w := range q.getWriters() {
 		writers = append(writers, w)
 		cWriters = append(cWriters, w)
 	}
