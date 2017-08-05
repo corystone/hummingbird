@@ -107,6 +107,22 @@ type quorumer interface {
 	getQ() int
 }
 
+type putQuorumer struct {
+	*stdQuorumer
+}
+
+func (p *putQuorumer) start() {
+	p.stdQuorumer.workers = make([]*quorumWorker, 0)
+	var workerGroup sync.WaitGroup
+	for i, dev := range p.stdQuorumer.devs {
+		worker := &quorumWorker{index: i, dev: dev, more: p.stdQuorumer.more, f: p.stdQuorumer.makeRequest, wg: &workerGroup, responses: p.stdQuorumer.responsec, q: p.stdQuorumer}
+		workerGroup.Add(1)
+		p.stdQuorumer.workers = append(p.stdQuorumer.workers, worker)
+		go worker.work()
+	}
+	workerGroup.Wait()
+}
+
 type stdQuorumer struct {
 	q                   int
 	makeRequest         func(int, *ring.Device, chan *http.Response, chan io.WriteCloser, chan struct{})
@@ -128,14 +144,11 @@ func (q *stdQuorumer) getQ() int {
 
 func (q *stdQuorumer) start() {
 	q.workers = make([]*quorumWorker, 0)
-	var workerGroup sync.WaitGroup
 	for i, dev := range q.devs {
-		worker := &quorumWorker{index: i, dev: dev, more: q.more, f: q.makeRequest, wg: &workerGroup, responses: q.responsec, q: q}
+		worker := &quorumWorker{index: i, dev: dev, more: q.more, f: q.makeRequest, responses: q.responsec, q: q}
 		q.workers = append(q.workers, worker)
-		workerGroup.Add(1)
 		go worker.work()
 	}
-	workerGroup.Wait()
 }
 
 func (q *stdQuorumer) addWriter(writer io.WriteCloser) {
@@ -152,7 +165,7 @@ func (q *stdQuorumer) addResponse(resp *http.Response) {
 
 func (q *stdQuorumer) getResponse(timeout time.Duration) *http.Response {
 	getResponseTimeout := time.After(timeout)
-	for i := 0; i < q.responseCount()+len(q.listWriters()); i++ {
+	for i := 0; i < len(q.workers); i++ {
 		outstandingRequests := len(q.workers) - len(q.responses)
 		// see if quorum has already been met
 		for _, r := range q.responses {
@@ -182,11 +195,14 @@ func (q *stdQuorumer) getResponse(timeout time.Duration) *http.Response {
 		}
 		// if we haven't made quorum, but it's still possible, then there
 		// are outstanding requests we need to wait on.
-		select {
-		case response := <-q.responsec:
-			q.addResponse(response)
-		case <-getResponseTimeout:
-			return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
+		if outstandingRequests > 0 {
+			select {
+			case response := <-q.responsec:
+				fmt.Printf("got response off responsec: %v\n", response)
+				q.addResponse(response)
+			case <-getResponseTimeout:
+				return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
+			}
 		}
 	}
 	return ResponseStub(http.StatusServiceUnavailable, "The service is currently unavailable.")
@@ -217,6 +233,20 @@ func newQuorumer(r ring.Ring, partition uint64, cancel chan struct{}, makeReques
 		cancel:              cancel,
 		responsec:           make(chan *http.Response),
 	}
+}
+
+func newPutQuorumer(r ring.Ring, partition uint64, cancel chan struct{}, makeRequest func(index int, dev *ring.Device, responsec chan *http.Response, ready chan io.WriteCloser, cancel chan struct{})) quorumer {
+	std := &stdQuorumer{
+		makeRequest:         makeRequest,
+		q:                   int(math.Ceil(float64(r.ReplicaCount()) / 2.0)),
+		replicaCount:        int(r.ReplicaCount()),
+		devs:                r.GetNodes(partition),
+		more:                r.GetMoreNodes(partition),
+		responseClassCounts: make([]int, 6),
+		cancel:              cancel,
+		responsec:           make(chan *http.Response),
+	}
+	return &putQuorumer{stdQuorumer: std}
 }
 
 // quorumResponse returns with a response representative of a quorum of nodes.
@@ -786,17 +816,16 @@ func (qw *quorumWorker) work() {
 				dev = qw.more.Next()
 				fmt.Printf("Moving to handoff: %+v\n", dev)
 			} else {
-				/* FIXME. Something like this */
 				fmt.Printf("Worker got response: %+v\n", resp)
 				qw.response = resp
-				dev = nil
 				qw.dev = dev
+				dev = nil
 			}
 		case qw.writer = <-ready:
 			fmt.Printf("Ready for dev: %+v\n", dev)
-			dev = nil
-			qw.dev = dev
 			qw.q.addWriter(qw.writer)
+			qw.dev = dev
+			dev = nil
 		}
 	}
 
@@ -826,7 +855,7 @@ func (oc *standardObjectClient) putObject(obj string, headers http.Header, src i
 
 	cancel := make(chan struct{})
 
-	q := newQuorumer(oc.objectRing, objectPartition, cancel, func(index int, dev *ring.Device, responsec chan *http.Response, ready chan io.WriteCloser, cancel chan struct{}) {
+	q := newPutQuorumer(oc.objectRing, objectPartition, cancel, func(index int, dev *ring.Device, responsec chan *http.Response, ready chan io.WriteCloser, cancel chan struct{}) {
 		trp, wp := io.Pipe()
 		rp := &putReader{Reader: trp, cancel: cancel, w: wp, ready: ready}
 		url := fmt.Sprintf("http://%s:%d/%s/%d/%s/%s/%s", dev.Ip, dev.Port, dev.Device, objectPartition,
