@@ -27,8 +27,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/gops/agent"
-
 	"github.com/troubling/hummingbird/accountserver"
 	"github.com/troubling/hummingbird/bench"
 	"github.com/troubling/hummingbird/common"
@@ -234,8 +232,6 @@ func init() {
 }
 
 func main() {
-	agent.Listen(nil)
-
 	proxyFlags := flag.NewFlagSet("proxy server", flag.ExitOnError)
 	proxyFlags.String("c", findConfig("proxy"), "Config file/directory to use")
 	proxyFlags.String("l", "stdout", "Log location")
