@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +31,7 @@ import (
 	"github.com/troubling/hummingbird/common"
 	"github.com/troubling/hummingbird/common/conf"
 	"github.com/troubling/hummingbird/common/fs"
+	"github.com/troubling/hummingbird/common/ring"
 	"github.com/troubling/hummingbird/common/srv"
 	"github.com/troubling/hummingbird/middleware"
 	"go.uber.org/zap"
@@ -49,6 +51,8 @@ type AuditorDaemon struct {
 	regFilesPerSecond int64
 	zbFilesPerSecond  int64
 	reconCachePath    string
+	hashPathPrefix    string
+	hashPathSuffix    string
 }
 
 // Auditor keeps track of general audit data.
@@ -143,6 +147,81 @@ func auditHash(hashPath string, skipMd5 bool) (bytesProcessed int64, err error) 
 	return bytesProcessed, nil
 }
 
+// auditShardHash of indexdb shard
+func auditNurseryObject(path string, metabytes []byte, skipMd5 bool) (bytesProcessed int64, err error) {
+	return bytesProcessed, nil
+}
+
+// auditShardHash of indexdb shard
+func auditShard(path string, hash string, skipMd5 bool) (bytesProcessed int64, err error) {
+	finfo, err := os.Stat(path)
+	if err != nil || !finfo.Mode().IsRegular() {
+		return bytesProcessed, fmt.Errorf("Object file isn't a normal file: %s", err)
+	}
+
+	if !skipMd5 {
+		file, err := os.Open(path)
+		if err != nil {
+			return bytesProcessed, fmt.Errorf("Error opening file: %s", err)
+		}
+		h := md5.New()
+		bytes, err := common.Copy(file, h)
+		if err != nil {
+			return bytesProcessed, fmt.Errorf("Error reading file: %s", err)
+		}
+		bytesProcessed += bytes
+		if hex.EncodeToString(h.Sum(nil)) != hash {
+			return bytesProcessed, fmt.Errorf("File contents don't match shard hash")
+		}
+	}
+	return bytesProcessed, nil
+}
+
+// auditDB.  Runs auditFunc on all objects in the given DB.
+func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(string, string, bool) (int64, error)) {
+	dbdir := filepath.Dir(dbpath)
+	base := filepath.Dir(dbdir)
+	path := filepath.Join(base, "hec")
+	temppath := "unused"
+	ringPartPower := bits.Len64(objRing.PartitionCount() - 1)
+	fmt.Printf("Part power: %v\n", ringPartPower)
+	//db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, a.logger)
+	db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, zap.L())
+	if err != nil {
+		fmt.Printf("Error: %+v\n", err)
+		a.logger.Error("Couldn't open indexdb", zap.String("dbpath", dbpath), zap.Error(err))
+		return
+	}
+
+	fmt.Printf("Part count: %v\n", objRing.PartitionCount())
+	for part := 0; uint64(part) < objRing.PartitionCount(); part++ {
+		items, err := db.List(part)
+		fmt.Printf("items: %+v\n", items)
+		if err != nil {
+			fmt.Printf("2 Error: %+v\n", err)
+			a.logger.Error("db.List failed", zap.Int("partition", part), zap.Error(err))
+			return
+		}
+		for _, item := range items {
+			shardPath, err := db.WholeObjectPath(item.Hash, item.Shard, item.Timestamp, item.Nursery)
+			if err != nil {
+				fmt.Printf("3 Error: %+v\n", err)
+				a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
+				continue
+			}
+			fullPath := filepath.Join(path, shardPath)
+			if item.Nursery {
+				fmt.Printf("auditfunc: %s, %+v\n", fullPath, item)
+				auditNurseryObject(fullPath, item.Metabytes, a.auditorType == "ZBF")
+			} else {
+				fmt.Printf("auditfunc: %s, %+v\n", fullPath, item)
+				auditFunc(fullPath, item.ShardHash, a.auditorType == "ZBF")
+			}
+		}
+	}
+
+}
+
 // auditSuffix directory.  Lists hash dirs, calls auditHash() for each, and quarantines any with errors.
 func (a *Auditor) auditSuffix(suffixDir string) {
 	hashes, err := fs.ReadDirNames(suffixDir)
@@ -214,27 +293,47 @@ func (a *Auditor) auditDevice(devPath string) {
 	}
 
 	for _, policy := range a.policies {
-		if policy.Type != "replication" {
-			continue
-		}
-		objPath := filepath.Join(devPath, PolicyDir(policy.Index))
-		partitions, err := fs.ReadDirNames(objPath)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				a.errors++
-				a.totalErrors++
-				a.logger.Error("Error reading objects dir", zap.String("objPath", objPath), zap.Error(err))
-			}
-			continue
-		}
-		for _, partition := range partitions {
-			_, intErr := strconv.ParseInt(partition, 10, 64)
-			partitionDir := filepath.Join(objPath, partition)
-			if finfo, err := os.Stat(partitionDir); err != nil || intErr != nil || !finfo.Mode().IsDir() {
-				a.logger.Error("Skipping invalid file in objects directory", zap.String("partitionDir", partitionDir), zap.Error(err))
+		fmt.Printf("******************POLICY: %+v\n", policy)
+		switch policy.Type {
+		case "replication":
+			objPath := filepath.Join(devPath, PolicyDir(policy.Index))
+			partitions, err := fs.ReadDirNames(objPath)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					a.errors++
+					a.totalErrors++
+					a.logger.Error("Error reading objects dir", zap.String("objPath", objPath), zap.Error(err))
+				}
 				continue
 			}
-			a.auditPartition(partitionDir)
+			for _, partition := range partitions {
+				_, intErr := strconv.ParseInt(partition, 10, 64)
+				partitionDir := filepath.Join(objPath, partition)
+				if finfo, err := os.Stat(partitionDir); err != nil || intErr != nil || !finfo.Mode().IsDir() {
+					a.logger.Error("Skipping invalid file in objects directory", zap.String("partitionDir", partitionDir), zap.Error(err))
+					continue
+				}
+				a.auditPartition(partitionDir)
+			}
+		case "hec":
+			r, err := ring.GetRing("object", a.hashPathPrefix, a.hashPathSuffix, policy.Index)
+			if err != nil {
+				a.logger.Error("Error getting object ring", zap.Int("policyindex", policy.Index))
+				continue
+			}
+			hecdbPath := filepath.Join(devPath, PolicyDir(policy.Index), "hec.db")
+			pattern := hecdbPath + "/index.db.??"
+			dbs, err := filepath.Glob(pattern)
+			if err != nil {
+				a.logger.Error("Bad glob pattern", zap.String("pattern", pattern))
+				continue
+			}
+			for _, db := range dbs {
+				a.auditDB(db, r, auditShard)
+			}
+		default:
+			a.logger.Error("Unknown policy type", zap.String("policytype", policy.Type))
+			continue
 		}
 	}
 }
@@ -359,6 +458,10 @@ func NewAuditorDaemon(serverconf conf.Config, flags *flag.FlagSet, cnf srv.Confi
 	d := &AuditorDaemon{}
 	if d.policies, err = cnf.GetPolicies(); err != nil {
 		return nil, err
+	}
+	d.hashPathPrefix, d.hashPathSuffix, err = cnf.GetHashPrefixAndSuffix()
+	if err != nil {
+		return nil, fmt.Errorf("Unable to load hashpath prefix and suffix")
 	}
 	d.driveRoot = serverconf.GetDefault("object-auditor", "devices", "/srv/node")
 	d.checkMounts = serverconf.GetBool("object-auditor", "mount_check", true)

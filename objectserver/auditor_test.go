@@ -267,7 +267,7 @@ func TestAuditSuffixQuarantine(t *testing.T) {
 	totalQuarantines := auditor.totalQuarantines
 	auditor.auditSuffix(filepath.Join(dir, "objects", "1", "abc"))
 	assert.Equal(t, totalQuarantines+1, auditor.totalQuarantines)
-	quarfiles, err := ioutil.ReadDir(filepath.Join(dir, "quarantined"))
+	quarfiles, err := ioutil.ReadDir(filepath.Join(dir, "quarantined", "objects"))
 	assert.Nil(t, err)
 	assert.Equal(t, 1, len(quarfiles))
 }
@@ -487,4 +487,63 @@ func TestStatReport(t *testing.T) {
 	//require.Equal(t, want[0].Context[7], obslog.Context[7])
 	require.Equal(t, want[0].Context[8], obslog.Context[8])
 	require.Equal(t, want[0].Context[9], obslog.Context[9])
+}
+
+func TestAuditDB(t *testing.T) {
+	fmt.Println("HEEEEYOOO?")
+	testRing := &test.FakeRing{}
+	confLoader := srv.NewTestConfigLoader(testRing)
+	auditor := makeAuditor(t, confLoader)
+	dir, _ := ioutil.TempDir("", "")
+	defer os.RemoveAll(dir)
+	dbdir := filepath.Join(dir, "hec.db")
+	hecdir := filepath.Join(dir, "hec")
+	db, err := NewIndexDB(dbdir, hecdir, dir, 2, 1, 32, zap.L())
+	assert.Nil(t, err)
+	body := "some shard content nonsense"
+	shardHash := "d3ac5112fe464b81184352ccba743001"
+	hash := "00000000000000000000000000000000"
+	timestamp := time.Now().UnixNano()
+	f, err := db.TempFile(hash, 0, timestamp, int64(len(body)), false)
+	assert.Nil(t, err)
+	f.Write([]byte(body))
+	err = db.Commit(f, hash, 0, timestamp, false, "", nil, false, shardHash)
+	assert.Nil(t, err)
+
+	var shards []string
+	shardHashFunc := func(path, hash string, nursery bool) (int64, error) {
+		shards = append(shards, hash)
+		return 0, nil
+	}
+
+	auditor.auditDB(db.dbpath, testRing, shardHashFunc)
+
+	assert.Equal(t, len(shards), 1)
+	assert.Equal(t, shards[0], shardHash)
+}
+
+func TestAuditShardPasses(t *testing.T) {
+	dir, _ := ioutil.TempDir("", "")
+	defer os.RemoveAll(dir)
+	fName := filepath.Join(dir, "12345")
+	f, _ := os.Create(filepath.Join(dir, "12345"))
+	defer f.Close()
+	hash := "d3ac5112fe464b81184352ccba743001"
+	f.Write([]byte("testcontents"))
+	bytesProcessed, err := auditShard(fName, hash, false)
+	assert.Nil(t, err)
+	assert.Equal(t, bytesProcessed, int64(12))
+}
+
+func TestAuditShardFailes(t *testing.T) {
+	dir, _ := ioutil.TempDir("", "")
+	defer os.RemoveAll(dir)
+	fName := filepath.Join(dir, "12345")
+	f, _ := os.Create(filepath.Join(dir, "12345"))
+	defer f.Close()
+	hash := "d3ac5112fe464b81184352ccba743001"
+	f.Write([]byte("testcontents"))
+	bytesProcessed, err := auditShard(fName, hash, false)
+	assert.Nil(t, err)
+	assert.Equal(t, bytesProcessed, int64(12))
 }
