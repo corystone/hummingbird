@@ -177,6 +177,26 @@ func auditShard(path string, hash string, skipMd5 bool) (bytesProcessed int64, e
 	return bytesProcessed, nil
 }
 
+func quarantineShard(db *IndexDB, hash string, shard int, timestamp int64, nursery bool) error {
+	shardPath, err := db.WholeObjectPath(hash, shard, timestamp, nursery)
+	if err != nil {
+		return err
+	}
+	shardName := filepath.Base(shardPath)
+	objsDir := filepath.Dir(filepath.Dir(filepath.Dir(shardPath)))
+	driveDir := filepath.Dir(objsDir)
+	quarantineDir := filepath.Join(driveDir, "quarantined", filepath.Base(objsDir))
+	if err := os.MkdirAll(quarantineDir, 0755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(quarantineDir, shardName), os.O_CREATE, 0644)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	return db.Remove(hash, shard, timestamp, nursery)
+}
+
 // auditDB.  Runs auditFunc on all objects in the given DB.
 func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(string, string, bool) (int64, error)) {
 	dbdir := filepath.Dir(dbpath)
@@ -184,42 +204,31 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(strin
 	path := filepath.Join(base, "hec")
 	temppath := "unused"
 	ringPartPower := bits.Len64(objRing.PartitionCount() - 1)
-	fmt.Printf("Part power: %v\n", ringPartPower)
 	//db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, a.logger)
 	db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, zap.L())
 	if err != nil {
-		fmt.Printf("Error: %+v\n", err)
 		a.logger.Error("Couldn't open indexdb", zap.String("dbpath", dbpath), zap.Error(err))
 		return
 	}
 
-	fmt.Printf("Part count: %v\n", objRing.PartitionCount())
-	for part := 0; uint64(part) < objRing.PartitionCount(); part++ {
-		items, err := db.List(part)
-		fmt.Printf("items: %+v\n", items)
+	items, err := db.List("00000000000000000000000000000000", "ffffffffffffffffffffffffffffffff", 0)
+	if err != nil {
+		a.logger.Error("db.List failed", zap.Error(err))
+		return
+	}
+	for _, item := range items {
+		shardPath, err := db.WholeObjectPath(item.Hash, item.Shard, item.Timestamp, item.Nursery)
 		if err != nil {
-			fmt.Printf("2 Error: %+v\n", err)
-			a.logger.Error("db.List failed", zap.Int("partition", part), zap.Error(err))
-			return
+			a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
+			continue
 		}
-		for _, item := range items {
-			shardPath, err := db.WholeObjectPath(item.Hash, item.Shard, item.Timestamp, item.Nursery)
-			if err != nil {
-				fmt.Printf("3 Error: %+v\n", err)
-				a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
-				continue
-			}
-			fullPath := filepath.Join(path, shardPath)
-			if item.Nursery {
-				fmt.Printf("auditfunc: %s, %+v\n", fullPath, item)
-				auditNurseryObject(fullPath, item.Metabytes, a.auditorType == "ZBF")
-			} else {
-				fmt.Printf("auditfunc: %s, %+v\n", fullPath, item)
-				auditFunc(fullPath, item.ShardHash, a.auditorType == "ZBF")
-			}
+		fullPath := filepath.Join(path, shardPath)
+		if item.Nursery {
+			auditNurseryObject(fullPath, item.Metabytes, a.auditorType == "ZBF")
+		} else {
+			auditFunc(fullPath, item.ShardHash, a.auditorType == "ZBF")
 		}
 	}
-
 }
 
 // auditSuffix directory.  Lists hash dirs, calls auditHash() for each, and quarantines any with errors.
@@ -293,7 +302,6 @@ func (a *Auditor) auditDevice(devPath string) {
 	}
 
 	for _, policy := range a.policies {
-		fmt.Printf("******************POLICY: %+v\n", policy)
 		switch policy.Type {
 		case "replication":
 			objPath := filepath.Join(devPath, PolicyDir(policy.Index))

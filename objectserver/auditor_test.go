@@ -496,8 +496,9 @@ func TestAuditDB(t *testing.T) {
 	auditor := makeAuditor(t, confLoader)
 	dir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(dir)
-	dbdir := filepath.Join(dir, "hec.db")
-	hecdir := filepath.Join(dir, "hec")
+	policydir := filepath.Join(dir, "objects")
+	dbdir := filepath.Join(policydir, "hec.db")
+	hecdir := filepath.Join(policydir, "hec")
 	db, err := NewIndexDB(dbdir, hecdir, dir, 2, 1, 32, zap.L())
 	assert.Nil(t, err)
 	body := "some shard content nonsense"
@@ -535,7 +536,7 @@ func TestAuditShardPasses(t *testing.T) {
 	assert.Equal(t, bytesProcessed, int64(12))
 }
 
-func TestAuditShardFailes(t *testing.T) {
+func TestAuditShardFails(t *testing.T) {
 	dir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(dir)
 	fName := filepath.Join(dir, "12345")
@@ -546,4 +547,37 @@ func TestAuditShardFailes(t *testing.T) {
 	bytesProcessed, err := auditShard(fName, hash, false)
 	assert.Nil(t, err)
 	assert.Equal(t, bytesProcessed, int64(12))
+}
+
+func TestQuarantineShard(t *testing.T) {
+	dir, _ := ioutil.TempDir("", "")
+	defer os.RemoveAll(dir)
+	policydir := filepath.Join(dir, "objects")
+	dbdir := filepath.Join(policydir, "hec.db")
+	hecdir := filepath.Join(policydir, "hec")
+	db, err := NewIndexDB(dbdir, hecdir, dir, 2, 1, 32, zap.L())
+	hash := "00000000000000000000000000000000"
+	timestamp := time.Now().UnixNano()
+	body := "nonsense"
+	f, err := db.TempFile(hash, 0, timestamp, int64(len(body)), false)
+	assert.Nil(t, err)
+	f.Write([]byte(body))
+	err = db.Commit(f, hash, 0, timestamp, false, "", nil, false, "unused")
+	assert.Nil(t, err)
+
+	err = quarantineShard(db, hash, 0, timestamp, false)
+	assert.Nil(t, err)
+
+	shardPath, err := db.WholeObjectPath(hash, 0, timestamp, false)
+	assert.Nil(t, err)
+	shard := filepath.Base(shardPath)
+	quarfiles, err := ioutil.ReadDir(filepath.Join(dir, "quarantined", "objects"))
+	assert.Nil(t, err)
+	if len(quarfiles) != 1 {
+		t.Fatal(1, len(quarfiles))
+	}
+	assert.Equal(t, shard, quarfiles[0].Name())
+	dbitem, err := db.Lookup(hash, 0, false)
+	assert.Nil(t, err)
+	assert.Nil(t, dbitem)
 }
