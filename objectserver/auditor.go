@@ -147,7 +147,7 @@ func auditHash(hashPath string, skipMd5 bool) (bytesProcessed int64, err error) 
 	return bytesProcessed, nil
 }
 
-// auditShardHash of indexdb shard
+// auditNurseryObject of indexdb shard
 func auditNurseryObject(path string, metabytes []byte, skipMd5 bool) (bytesProcessed int64, err error) {
 	return bytesProcessed, nil
 }
@@ -199,13 +199,16 @@ func quarantineShard(db *IndexDB, hash string, shard int, timestamp int64, nurse
 
 // auditDB.  Runs auditFunc on all objects in the given DB.
 func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(string, string, bool) (int64, error)) {
-	dbdir := filepath.Dir(dbpath)
-	base := filepath.Dir(dbdir)
-	path := filepath.Join(base, "hec")
-	temppath := "unused"
+	policyDir := filepath.Dir(dbpath)
+	path := filepath.Join(policyDir, "hec")
+	temppath := filepath.Join(filepath.Dir(policyDir), "tmp")
 	ringPartPower := bits.Len64(objRing.PartitionCount() - 1)
-	//db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, a.logger)
-	db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, zap.L())
+	zapLogger, ok := a.logger.(*zap.Logger)
+	if !ok {
+		a.logger.Error("Logger type assertion failed")
+		zapLogger = zap.L()
+	}
+	db, err := NewIndexDB(dbpath, path, temppath, ringPartPower, 1, 32, zapLogger)
 	if err != nil {
 		a.logger.Error("Couldn't open indexdb", zap.String("dbpath", dbpath), zap.Error(err))
 		return
@@ -213,7 +216,9 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(strin
 
 	items, err := db.List("00000000000000000000000000000000", "ffffffffffffffffffffffffffffffff", 0)
 	if err != nil {
-		a.logger.Error("db.List failed", zap.Error(err))
+		a.errors++
+		a.totalErrors++
+		a.logger.Error("db.List failed", zap.String("dbpath", dbpath), zap.Error(err))
 		return
 	}
 	for _, item := range items {
@@ -222,11 +227,26 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(strin
 			a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
 			continue
 		}
-		fullPath := filepath.Join(path, shardPath)
 		if item.Nursery {
-			auditNurseryObject(fullPath, item.Metabytes, a.auditorType == "ZBF")
+			auditNurseryObject(shardPath, item.Metabytes, a.auditorType == "ZBF")
 		} else {
-			auditFunc(fullPath, item.ShardHash, a.auditorType == "ZBF")
+			bytesProcessed, err := auditFunc(shardPath, item.ShardHash, a.auditorType == "ZBF")
+			a.bytesProcessed += bytesProcessed
+			a.totalBytes += bytesProcessed
+			if err != nil {
+				a.logger.Error("Failed audit and is being quarantined",
+					zap.String("shardPath", shardPath),
+					zap.Error(err))
+				err = quarantineShard(db, item.Hash, item.Shard, item.Timestamp, item.Nursery)
+				if err != nil {
+					a.errors++
+					a.totalErrors++
+					a.logger.Error("Failed to quarantine shard", zap.String("shardPath", shardPath), zap.Error(err))
+					continue
+				}
+				a.quarantines++
+				a.totalQuarantines++
+			}
 		}
 	}
 }
@@ -330,15 +350,10 @@ func (a *Auditor) auditDevice(devPath string) {
 				continue
 			}
 			hecdbPath := filepath.Join(devPath, PolicyDir(policy.Index), "hec.db")
-			pattern := hecdbPath + "/index.db.??"
-			dbs, err := filepath.Glob(pattern)
-			if err != nil {
-				a.logger.Error("Bad glob pattern", zap.String("pattern", pattern))
+			if _, err := os.Stat(hecdbPath); os.IsNotExist(err) {
 				continue
 			}
-			for _, db := range dbs {
-				a.auditDB(db, r, auditShard)
-			}
+			a.auditDB(hecdbPath, r, auditShard)
 		default:
 			a.logger.Error("Unknown policy type", zap.String("policytype", policy.Type))
 			continue
