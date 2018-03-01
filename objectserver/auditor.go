@@ -223,7 +223,8 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditShardFunc func(
 		for _, item := range items {
 			shardPath, err := db.WholeObjectPath(item.Hash, item.Shard, item.Timestamp, item.Nursery)
 			if err != nil {
-				a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
+				a.logger.Error("Error getting indexdb path for hash",
+					zap.String("hash", item.Hash), zap.Error(err))
 				continue
 			}
 			if item.Nursery {
@@ -232,8 +233,7 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditShardFunc func(
 				err := auditShardFunc(shardPath, item.ShardHash, a.auditorType == "ZBF")
 				if err != nil {
 					a.logger.Error("Failed audit and is being quarantined",
-						zap.String("shardPath", shardPath),
-						zap.Error(err))
+						zap.String("shardPath", shardPath), zap.Error(err))
 					err = quarantineShard(db, item.Hash, item.Shard, item.Timestamp, item.Nursery)
 					if err != nil {
 						a.logger.Error("Failed to quarantine shard", zap.String("shardPath", shardPath), zap.Error(err))
@@ -336,7 +336,8 @@ func (a *Auditor) auditDevice(devPath string) {
 				_, intErr := strconv.ParseInt(partition, 10, 64)
 				partitionDir := filepath.Join(objPath, partition)
 				if finfo, err := os.Stat(partitionDir); err != nil || intErr != nil || !finfo.Mode().IsDir() {
-					a.logger.Error("Skipping invalid file in objects directory", zap.String("partitionDir", partitionDir), zap.Error(err))
+					a.logger.Error("Skipping invalid file in objects directory",
+						zap.String("partitionDir", partitionDir), zap.Error(err))
 					continue
 				}
 				a.auditPartition(partitionDir)
