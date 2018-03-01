@@ -215,7 +215,7 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditShardFunc func(
 
 	marker := ""
 	for {
-		items, err := db.List("00000000000000000000000000000000", "ffffffffffffffffffffffffffffffff", marker, 1000)
+		items, err := db.List("", "", marker, 1000)
 		if err != nil {
 			a.logger.Error("db.List failed", zap.String("dbpath", dbpath), zap.Error(err))
 			return
