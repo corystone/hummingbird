@@ -485,7 +485,6 @@ func TestIndexDB_ListMarker(t *testing.T) {
 		errnil(t, err)
 		f.Write([]byte(body))
 		errnil(t, ot.Commit(f, hsh, 0, timestamp, false, "", nil, true, ""))
-		fmt.Printf("HASH: %s\n", hsh)
 	}
 
 	listing, err := ot.List("", "", "e0000000000000000000000000000000", 0)

@@ -509,19 +509,32 @@ func TestAuditDB(t *testing.T) {
 	f.Write([]byte(body))
 	err = db.Commit(f, hash, 0, timestamp, false, "", nil, false, shardHash)
 	assert.Nil(t, err)
+	hash1 := "00000000000000000000000000000001"
+	f, err = db.TempFile(hash1, 0, timestamp, int64(len(body)), false)
+	assert.Nil(t, err)
+	f.Write([]byte(body))
+	err = db.Commit(f, hash1, 0, timestamp, false, "", nil, false, shardHash)
+	assert.Nil(t, err)
+	hash2 := "00000000000000000000000000000002"
+	f, err = db.TempFile(hash2, 0, timestamp, int64(len(body)), false)
+	assert.Nil(t, err)
+	f.Write([]byte(body))
+	err = db.Commit(f, hash2, 0, timestamp, false, "", nil, false, shardHash)
+	assert.Nil(t, err)
+
 	shardPath, err := db.WholeObjectPath(hash, 0, timestamp, false)
 
 	var paths []string
 	var shards []string
-	shardHashFunc := func(path, hash string, nursery bool) (int64, error) {
+	testAuditShardFunc := func(path, hash string, nursery bool) error {
 		paths = append(paths, path)
 		shards = append(shards, hash)
-		return 0, nil
+		return nil
 	}
 
-	auditor.auditDB(db.dbpath, testRing, shardHashFunc)
+	auditor.auditDB(db.dbpath, testRing, testAuditShardFunc)
 
-	assert.Equal(t, 1, len(paths))
+	assert.Equal(t, 3, len(paths))
 	assert.Equal(t, shardPath, paths[0])
 	assert.Equal(t, shardHash, shards[0])
 }
@@ -534,9 +547,8 @@ func TestAuditShardPasses(t *testing.T) {
 	hash := "d3ac5112fe464b81184352ccba743001"
 	f.Write([]byte("testcontents"))
 	f.Close()
-	bytesProcessed, err := auditShard(fName, hash, false)
+	err := auditShard(fName, hash, false)
 	assert.Nil(t, err)
-	assert.Equal(t, int64(12), bytesProcessed)
 }
 
 func TestAuditShardFails(t *testing.T) {
@@ -547,9 +559,8 @@ func TestAuditShardFails(t *testing.T) {
 	hash := "d3ac5112fe464b81184352ccba743001"
 	f.Write([]byte("asdftestcontents"))
 	f.Close()
-	bytesProcessed, err := auditShard(fName, hash, false)
+	err := auditShard(fName, hash, false)
 	assert.NotNil(t, err)
-	assert.Equal(t, int64(16), bytesProcessed)
 }
 
 func TestQuarantineShard(t *testing.T) {

@@ -147,34 +147,33 @@ func auditHash(hashPath string, skipMd5 bool) (bytesProcessed int64, err error) 
 	return bytesProcessed, nil
 }
 
-// auditNurseryObject of indexdb shard
-func auditNurseryObject(path string, metabytes []byte, skipMd5 bool) (bytesProcessed int64, err error) {
-	return bytesProcessed, nil
+// auditNurseryObject of indexdb shard, does nothing
+func auditNurseryObject(path string, metabytes []byte, skipMd5 bool) error {
+	return nil
 }
 
 // auditShardHash of indexdb shard
-func auditShard(path string, hash string, skipMd5 bool) (bytesProcessed int64, err error) {
+func auditShard(path string, hash string, skipMd5 bool) error {
 	finfo, err := os.Stat(path)
 	if err != nil || !finfo.Mode().IsRegular() {
-		return bytesProcessed, fmt.Errorf("Object file isn't a normal file: %s", err)
+		return fmt.Errorf("Object file isn't a normal file: %s", err)
 	}
 
 	if !skipMd5 {
 		file, err := os.Open(path)
 		if err != nil {
-			return bytesProcessed, fmt.Errorf("Error opening file: %s", err)
+			return fmt.Errorf("Error opening file: %s", err)
 		}
 		h := md5.New()
-		bytes, err := common.Copy(file, h)
+		_, err = common.Copy(file, h)
 		if err != nil {
-			return bytesProcessed, fmt.Errorf("Error reading file: %s", err)
+			return fmt.Errorf("Error reading file: %s", err)
 		}
-		bytesProcessed += bytes
 		if hex.EncodeToString(h.Sum(nil)) != hash {
-			return bytesProcessed, fmt.Errorf("File contents don't match shard hash")
+			return fmt.Errorf("File contents don't match shard hash")
 		}
 	}
-	return bytesProcessed, nil
+	return nil
 }
 
 func quarantineShard(db *IndexDB, hash string, shard int, timestamp int64, nursery bool) error {
@@ -198,7 +197,7 @@ func quarantineShard(db *IndexDB, hash string, shard int, timestamp int64, nurse
 }
 
 // auditDB.  Runs auditFunc on all objects in the given DB.
-func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(string, string, bool) (int64, error)) {
+func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditShardFunc func(string, string, bool) error) {
 	policyDir := filepath.Dir(dbpath)
 	path := filepath.Join(policyDir, "hec")
 	temppath := filepath.Join(filepath.Dir(policyDir), "tmp")
@@ -214,40 +213,39 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditFunc func(strin
 		return
 	}
 
-	items, err := db.List("00000000000000000000000000000000", "ffffffffffffffffffffffffffffffff", 0)
-	if err != nil {
-		a.errors++
-		a.totalErrors++
-		a.logger.Error("db.List failed", zap.String("dbpath", dbpath), zap.Error(err))
-		return
-	}
-	for _, item := range items {
-		shardPath, err := db.WholeObjectPath(item.Hash, item.Shard, item.Timestamp, item.Nursery)
+	marker := ""
+	for {
+		items, err := db.List("00000000000000000000000000000000", "ffffffffffffffffffffffffffffffff", marker, 1000)
 		if err != nil {
-			a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
-			continue
+			a.logger.Error("db.List failed", zap.String("dbpath", dbpath), zap.Error(err))
+			return
 		}
-		if item.Nursery {
-			auditNurseryObject(shardPath, item.Metabytes, a.auditorType == "ZBF")
-		} else {
-			bytesProcessed, err := auditFunc(shardPath, item.ShardHash, a.auditorType == "ZBF")
-			a.bytesProcessed += bytesProcessed
-			a.totalBytes += bytesProcessed
+		for _, item := range items {
+			shardPath, err := db.WholeObjectPath(item.Hash, item.Shard, item.Timestamp, item.Nursery)
 			if err != nil {
-				a.logger.Error("Failed audit and is being quarantined",
-					zap.String("shardPath", shardPath),
-					zap.Error(err))
-				err = quarantineShard(db, item.Hash, item.Shard, item.Timestamp, item.Nursery)
+				a.logger.Error("Error getting indexdb path for hash", zap.String("hash", item.Hash), zap.Error(err))
+				continue
+			}
+			if item.Nursery {
+				auditNurseryObject(shardPath, item.Metabytes, a.auditorType == "ZBF")
+			} else {
+				err := auditShardFunc(shardPath, item.ShardHash, a.auditorType == "ZBF")
 				if err != nil {
-					a.errors++
-					a.totalErrors++
-					a.logger.Error("Failed to quarantine shard", zap.String("shardPath", shardPath), zap.Error(err))
-					continue
+					a.logger.Error("Failed audit and is being quarantined",
+						zap.String("shardPath", shardPath),
+						zap.Error(err))
+					err = quarantineShard(db, item.Hash, item.Shard, item.Timestamp, item.Nursery)
+					if err != nil {
+						a.logger.Error("Failed to quarantine shard", zap.String("shardPath", shardPath), zap.Error(err))
+						continue
+					}
 				}
-				a.quarantines++
-				a.totalQuarantines++
 			}
 		}
+		if len(items) == 0 {
+			return
+		}
+		marker = items[len(items)-1].Hash
 	}
 }
 
