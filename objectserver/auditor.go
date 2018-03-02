@@ -66,6 +66,43 @@ type Auditor struct {
 	bytesProcessed, totalBytes    int64
 	quarantines, totalQuarantines int64
 	errors, totalErrors           int64
+	ecfuncs                       ECAuditFuncs
+}
+
+type ECAuditFuncs interface {
+	AuditShard(path string, hash string, skipMd5 bool) error
+	AuditNurseryObject(path string, metabytes []byte, skipMd5 bool) error
+}
+
+type RealECAuditFuncs struct{}
+
+// AuditNurseryObject of indexdb shard, does nothing
+func (RealECAuditFuncs) AuditNurseryObject(path string, metabytes []byte, skipMd5 bool) error {
+	return nil
+}
+
+// AuditShardHash of indexdb shard
+func (RealECAuditFuncs) AuditShard(path string, hash string, skipMd5 bool) error {
+	finfo, err := os.Stat(path)
+	if err != nil || !finfo.Mode().IsRegular() {
+		return fmt.Errorf("Object file isn't a normal file: %s", err)
+	}
+
+	if !skipMd5 {
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("Error opening file: %s", err)
+		}
+		h := md5.New()
+		_, err = common.Copy(file, h)
+		if err != nil {
+			return fmt.Errorf("Error reading file: %s", err)
+		}
+		if hex.EncodeToString(h.Sum(nil)) != hash {
+			return fmt.Errorf("File contents don't match shard hash")
+		}
+	}
+	return nil
 }
 
 // OneTimeChan returns a channel that will yield the current time once, then is closed.
@@ -147,35 +184,6 @@ func auditHash(hashPath string, skipMd5 bool) (bytesProcessed int64, err error) 
 	return bytesProcessed, nil
 }
 
-// auditNurseryObject of indexdb shard, does nothing
-func auditNurseryObject(path string, metabytes []byte, skipMd5 bool) error {
-	return nil
-}
-
-// auditShardHash of indexdb shard
-func auditShard(path string, hash string, skipMd5 bool) error {
-	finfo, err := os.Stat(path)
-	if err != nil || !finfo.Mode().IsRegular() {
-		return fmt.Errorf("Object file isn't a normal file: %s", err)
-	}
-
-	if !skipMd5 {
-		file, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("Error opening file: %s", err)
-		}
-		h := md5.New()
-		_, err = common.Copy(file, h)
-		if err != nil {
-			return fmt.Errorf("Error reading file: %s", err)
-		}
-		if hex.EncodeToString(h.Sum(nil)) != hash {
-			return fmt.Errorf("File contents don't match shard hash")
-		}
-	}
-	return nil
-}
-
 func quarantineShard(db *IndexDB, hash string, shard int, timestamp int64, nursery bool) error {
 	shardPath, err := db.WholeObjectPath(hash, shard, timestamp, nursery)
 	if err != nil {
@@ -197,7 +205,7 @@ func quarantineShard(db *IndexDB, hash string, shard int, timestamp int64, nurse
 }
 
 // auditDB.  Runs auditFunc on all objects in the given DB.
-func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditShardFunc func(string, string, bool) error) {
+func (a *Auditor) auditDB(dbpath string, objRing ring.Ring) {
 	policyDir := filepath.Dir(dbpath)
 	path := filepath.Join(policyDir, "hec")
 	temppath := filepath.Join(filepath.Dir(policyDir), "tmp")
@@ -228,9 +236,9 @@ func (a *Auditor) auditDB(dbpath string, objRing ring.Ring, auditShardFunc func(
 				continue
 			}
 			if item.Nursery {
-				auditNurseryObject(shardPath, item.Metabytes, a.auditorType == "ZBF")
+				a.ecfuncs.AuditNurseryObject(shardPath, item.Metabytes, a.auditorType == "ZBF")
 			} else {
-				err := auditShardFunc(shardPath, item.ShardHash, a.auditorType == "ZBF")
+				err := a.ecfuncs.AuditShard(shardPath, item.ShardHash, a.auditorType == "ZBF")
 				if err != nil {
 					a.logger.Error("Failed audit and is being quarantined",
 						zap.String("shardPath", shardPath), zap.Error(err))
@@ -352,7 +360,7 @@ func (a *Auditor) auditDevice(devPath string) {
 			if _, err := os.Stat(hecdbPath); os.IsNotExist(err) {
 				continue
 			}
-			a.auditDB(hecdbPath, r, auditShard)
+			a.auditDB(hecdbPath, r)
 		default:
 			a.logger.Error("Unknown policy type", zap.String("policytype", policy.Type))
 			continue
@@ -451,7 +459,7 @@ func (d *AuditorDaemon) Run() {
 	if d.zbFilesPerSecond > 0 {
 		wg.Add(1)
 		go func() {
-			zba := Auditor{AuditorDaemon: d, auditorType: "ZBF", mode: "once", filesPerSecond: d.zbFilesPerSecond}
+			zba := Auditor{AuditorDaemon: d, auditorType: "ZBF", mode: "once", filesPerSecond: d.zbFilesPerSecond, ecfuncs: RealECAuditFuncs{}}
 			zba.run(OneTimeChan())
 			wg.Done()
 		}()

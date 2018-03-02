@@ -38,6 +38,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type FakeECAuditFuncs struct {
+	paths  []string
+	shards []string
+}
+
+// AuditNurseryObject of indexdb shard, does nothing
+func (f *FakeECAuditFuncs) AuditNurseryObject(path string, metabytes []byte, skipMd5 bool) error {
+	return nil
+}
+
+// AuditShardHash of indexdb shard
+func (f *FakeECAuditFuncs) AuditShard(path string, hash string, skipMd5 bool) error {
+	fmt.Printf("HELLO? f: %p\n", f)
+	f.paths = append(f.paths, path)
+	f.shards = append(f.shards, hash)
+	fmt.Printf("paths: %p %+v\n", f.paths, f.paths)
+	return nil
+}
+
 func TestAuditHashPasses(t *testing.T) {
 	dir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(dir)
@@ -211,7 +230,7 @@ func makeAuditor(t *testing.T, confLoader *srv.TestConfigLoader, settings ...str
 	require.Nil(t, err)
 	obs, logs = observer.New(zap.InfoLevel)
 	auditorDaemon.logger = zap.New(obs)
-	return &Auditor{AuditorDaemon: auditorDaemon, filesPerSecond: 1}
+	return &Auditor{AuditorDaemon: auditorDaemon, filesPerSecond: 1, ecfuncs: RealECAuditFuncs{}}
 }
 
 func TestFailsWithoutSection(t *testing.T) {
@@ -493,6 +512,8 @@ func TestAuditDB(t *testing.T) {
 	testRing := &test.FakeRing{}
 	confLoader := srv.NewTestConfigLoader(testRing)
 	auditor := makeAuditor(t, confLoader)
+	fakes := &FakeECAuditFuncs{}
+	auditor.ecfuncs = fakes
 	dir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(dir)
 	policydir := filepath.Join(dir, "objects")
@@ -524,22 +545,15 @@ func TestAuditDB(t *testing.T) {
 
 	shardPath, err := db.WholeObjectPath(hash, 0, timestamp, false)
 
-	var paths []string
-	var shards []string
-	testAuditShardFunc := func(path, hash string, nursery bool) error {
-		paths = append(paths, path)
-		shards = append(shards, hash)
-		return nil
-	}
+	auditor.auditDB(db.dbpath, testRing)
 
-	auditor.auditDB(db.dbpath, testRing, testAuditShardFunc)
-
-	assert.Equal(t, 3, len(paths))
-	assert.Equal(t, shardPath, paths[0])
-	assert.Equal(t, shardHash, shards[0])
+	assert.Equal(t, 3, len(fakes.paths))
+	assert.Equal(t, shardPath, fakes.paths[0])
+	assert.Equal(t, shardHash, fakes.shards[0])
 }
 
 func TestAuditShardPasses(t *testing.T) {
+	auditFuncs := RealECAuditFuncs{}
 	dir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(dir)
 	fName := filepath.Join(dir, "12345")
@@ -547,11 +561,12 @@ func TestAuditShardPasses(t *testing.T) {
 	hash := "d3ac5112fe464b81184352ccba743001"
 	f.Write([]byte("testcontents"))
 	f.Close()
-	err := auditShard(fName, hash, false)
+	err := auditFuncs.AuditShard(fName, hash, false)
 	assert.Nil(t, err)
 }
 
 func TestAuditShardFails(t *testing.T) {
+	auditFuncs := RealECAuditFuncs{}
 	dir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(dir)
 	fName := filepath.Join(dir, "12345")
@@ -559,7 +574,7 @@ func TestAuditShardFails(t *testing.T) {
 	hash := "d3ac5112fe464b81184352ccba743001"
 	f.Write([]byte("asdftestcontents"))
 	f.Close()
-	err := auditShard(fName, hash, false)
+	err := auditFuncs.AuditShard(fName, hash, false)
 	assert.NotNil(t, err)
 }
 
