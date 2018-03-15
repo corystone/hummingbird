@@ -217,6 +217,17 @@ func (qr *quarantineRepair) retrieveTypeToDeviceToEntries(logger *zap.Logger, ur
 	return typeToDeviceToEntries
 }
 
+func (qr *quarantineRepair) repairHECObject(logger *zap.Logger, policy int, ringg ring.Ring, entryNameInURL, account, container, object string) bool {
+	logger.Debug("ATTEMPTING REPAIR OF OBJECT", zap.String("OBJECTNAME", entryNameInURL))
+	partition := ringg.GetPartition(account, container, object)
+	logger = logger.With(zap.Uint64("partition", partition))
+	for _, device := range ringg.GetNodes(partition) {
+		url := fmt.Sprintf("%s://%s:%d/ec-reconstruct/%s/%d/%s/%s/%s", device.Scheme, device.Ip, device.Port, device.Device, partition, account, container, object)
+		logger.Debug("RECONSTRUCT URL", zap.String("url", url))
+	}
+	return false
+}
+
 // repairObject tries to ensure all replicas are in place for the quarantined
 // entry and returns true if the entry should be deleted as it has been handled
 // as best as is possible.
@@ -259,6 +270,12 @@ func (qr *quarantineRepair) repairObject(logger *zap.Logger, typ string, policy 
 			return false
 		}
 	}
+
+	policyObj := qr.aa.policies[policy]
+	if policyObj.Type == "hec" {
+		return qr.repairHECObject(logger, policy, ringg, entryNameInURL, account, container, object)
+	}
+
 	partition := ringg.GetPartition(account, container, object)
 	logger = logger.With(zap.Uint64("partition", partition))
 	var have, notfound, unsure []*ring.Device

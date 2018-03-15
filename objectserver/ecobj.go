@@ -26,7 +26,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -266,6 +265,117 @@ func (o *ecObject) Close() error {
 	return nil
 }
 
+func (o *ecObject) Reconstruct() error {
+	// Else reconstruct the shard and copy over that
+	success := true
+	algo, dataFrags, parityFrags, chunkSize, err := parseECScheme(o.metadata["Ec-Scheme"])
+	if err != nil {
+		return fmt.Errorf("Invalid scheme: %v", err)
+	}
+	if algo != "reedsolomon" {
+		return fmt.Errorf("Attempt to read EC object with unknown algorithm '%s'", algo)
+	}
+	contentLength := o.ContentLength()
+	ns := strings.SplitN(o.metadata["name"], "/", 4)
+	if len(ns) != 4 {
+		return fmt.Errorf("invalid metadata name: %s", o.metadata["name"])
+	}
+	nodes := o.ring.GetNodes(o.ring.GetPartition(ns[1], ns[2], ns[3]))
+	if len(nodes) < dataFrags+parityFrags {
+		return fmt.Errorf("Not enough nodes (%d) for scheme (%d)", len(nodes), dataFrags+parityFrags)
+	}
+	bodies := make([]io.Reader, len(nodes))
+	readSuccesses := 0
+	failed := make([]*ring.Device, len(nodes))
+	for i, node := range nodes {
+		url := fmt.Sprintf("%s://%s:%d/ec-frag/%s/%s/%d", node.Scheme, node.Ip, node.Port, node.Device, o.Hash, i)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			failed[i] = node
+			continue
+		}
+		req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(o.policy))
+		resp, err := o.client.Do(req)
+		if err != nil {
+			failed[i] = node
+			continue
+		}
+		defer func() {
+			io.Copy(ioutil.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+		if resp.StatusCode != http.StatusOK {
+			failed[i] = node
+			continue
+		}
+		bodies[i] = resp.Body
+		readSuccesses++
+	}
+	if readSuccesses < dataFrags {
+		return fmt.Errorf("Not enough nodes (%d) to reconstruct from (%d)", readSuccesses, dataFrags)
+	}
+
+	var writers []io.Writer
+	var writeClosers []io.WriteCloser
+	var shardsToFix []int
+	writeSuccess := make(chan bool)
+
+	for i, node := range failed {
+		if node == nil {
+			continue
+		}
+		rp, wp := io.Pipe()
+		defer wp.Close()
+		defer rp.Close()
+		req, err := http.NewRequest("PUT", fmt.Sprintf("%s://%s:%d/ec-frag/%s/%s/%d", node.Scheme, node.Ip, node.Port, node.Device, o.Hash, i), rp)
+		if err != nil {
+			writeSuccess <- false
+			continue
+		}
+		req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(o.policy))
+		req.Header.Set("Meta-Ec-Scheme", fmt.Sprintf("reedsolomon/%d/%d/%d", o.dataFrags, o.parityFrags, o.chunkSize))
+		for k, v := range o.metadata {
+			req.Header.Set("Meta-"+k, v)
+		}
+		writers = append(writers, io.Writer(wp))
+		writeClosers = append(writeClosers, io.WriteCloser(wp))
+		shardsToFix = append(shardsToFix, i)
+		go func(req *http.Request) {
+			if resp, err := o.client.Do(req); err != nil {
+				writeSuccess <- false
+			} else {
+				io.Copy(ioutil.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode/100 != 2 {
+					writeSuccess <- false
+					return
+				}
+				writeSuccess <- true
+			}
+		}(req)
+	}
+	err = ecReconstruct(dataFrags, parityFrags, bodies, chunkSize, contentLength, writers, shardsToFix)
+	waitingFor := dataFrags + parityFrags - readSuccesses
+	for waitingFor > 0 {
+		select {
+		case result := <-writeSuccess:
+			if result == false {
+				success = false
+			}
+			waitingFor--
+		}
+	}
+
+	for _, writer := range writeClosers {
+		writer.Close()
+	}
+
+	if !success {
+		return fmt.Errorf("Failed to replicate")
+	}
+	return err
+}
+
 func (o *ecObject) Replicate(prirep PriorityRepJob) error {
 	// If we are handoff, just replicate the shard and delete local shard
 	if _, handoff := o.ring.GetJobNodes(prirep.Partition, prirep.FromDevice.Id); handoff {
@@ -293,89 +403,7 @@ func (o *ecObject) Replicate(prirep PriorityRepJob) error {
 		}
 		return o.idb.Remove(o.Hash, o.Shard, o.Timestamp, true)
 	}
-	// Else reconstruct the shard and copy over that
-	success := true
-	algo, dataFrags, parityFrags, chunkSize, err := parseECScheme(o.metadata["Ec-Scheme"])
-	if err != nil {
-		return fmt.Errorf("Invalid scheme: %v", err)
-	}
-	if algo != "reedsolomon" {
-		return fmt.Errorf("Attempt to read EC object with unknown algorithm '%s'", algo)
-	}
-	contentLength := o.ContentLength()
-	ns := strings.SplitN(o.metadata["name"], "/", 4)
-	if len(ns) != 4 {
-		return fmt.Errorf("invalid metadata name: %s", o.metadata["name"])
-	}
-	nodes := o.ring.GetNodes(o.ring.GetPartition(ns[1], ns[2], ns[3]))
-	if len(nodes) < dataFrags+parityFrags {
-		return fmt.Errorf("Not enough nodes (%d) for scheme (%d)", len(nodes), dataFrags+parityFrags)
-	}
-	bodies := make([]io.Reader, len(nodes))
-	toDeviceShard := -1
-	for i, node := range nodes {
-		if node.Id == prirep.ToDevice.Id {
-			toDeviceShard = i
-			continue
-		}
-		url := fmt.Sprintf("%s://%s:%d/ec-frag/%s/%s/%d", node.Scheme, node.Ip, node.Port, node.Device, o.Hash, i)
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(o.policy))
-		resp, err := o.client.Do(req)
-		if err != nil {
-			continue
-		}
-		defer func() {
-			io.Copy(ioutil.Discard, resp.Body)
-			resp.Body.Close()
-		}()
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-		bodies[i] = resp.Body
-	}
-	if toDeviceShard == -1 {
-		return fmt.Errorf("ToDevice %s:%d  %s is not in list of nodes for this object", prirep.ToDevice.Ip, prirep.ToDevice.Port, prirep.ToDevice.Device)
-	}
-	rp, wp := io.Pipe()
-	defer wp.Close()
-	defer rp.Close()
-	req, err := http.NewRequest("PUT", fmt.Sprintf("%s://%s:%d/ec-frag/%s/%s/%d", prirep.ToDevice.Scheme, prirep.ToDevice.Ip, prirep.ToDevice.Port, prirep.ToDevice.Device, o.Hash, toDeviceShard), rp)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(prirep.Policy))
-	req.Header.Set("Meta-Ec-Scheme", fmt.Sprintf("reedsolomon/%d/%d/%d", o.dataFrags, o.parityFrags, o.chunkSize))
-	for k, v := range o.metadata {
-		req.Header.Set("Meta-"+k, v)
-	}
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func(req *http.Request) {
-		defer wg.Done()
-		if resp, err := o.client.Do(req); err != nil {
-			success = false
-			return
-		} else {
-			io.Copy(ioutil.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode/100 != 2 {
-				success = false
-				return
-			}
-		}
-	}(req)
-	var writer io.WriteCloser = wp
-	err = ecReconstruct(dataFrags, parityFrags, bodies, chunkSize, contentLength, writer, toDeviceShard)
-	writer.Close()
-	wg.Wait()
-	if !success {
-		return fmt.Errorf("Failed to replicate")
-	}
-	return err
+	return o.Reconstruct()
 }
 
 func (o *ecObject) nurseryReplicate(rng ring.Ring, partition uint64, dev *ring.Device) error {
