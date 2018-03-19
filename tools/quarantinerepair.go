@@ -222,8 +222,22 @@ func (qr *quarantineRepair) repairHECObject(logger *zap.Logger, policy int, ring
 	partition := ringg.GetPartition(account, container, object)
 	logger = logger.With(zap.Uint64("partition", partition))
 	for _, device := range ringg.GetNodes(partition) {
-		url := fmt.Sprintf("%s://%s:%d/ec-reconstruct/%s/%d/%s/%s/%s", device.Scheme, device.Ip, device.Port, device.Device, partition, account, container, object)
+		url := fmt.Sprintf("%s://%s:%d/ec-reconstruct/%s/%s/%s/%s", device.Scheme, device.Ip, device.Port, device.Device, account, container, object)
 		logger.Debug("RECONSTRUCT URL", zap.String("url", url))
+		req, err := http.NewRequest("PUT", url, nil)
+		if err != nil {
+			logger.Error("repair HEC http.NewRequest", zap.Error(err))
+			continue
+		}
+		resp, err := qr.aa.client.Do(req)
+		if err != nil {
+			logger.Error("repair HEC client.Do", zap.Error(err))
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode/100 == 2 {
+			return true
+		}
 	}
 	return false
 }

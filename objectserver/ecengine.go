@@ -124,6 +124,7 @@ func (f *ecEngine) GetReplicationDevice(oring ring.Ring, dev *ring.Device, polic
 }
 
 func (f *ecEngine) ecFragGetHandler(writer http.ResponseWriter, request *http.Request) {
+	srv.GetLogger(request).Error("EC FRAG GET!")
 	vars := srv.GetVars(request)
 	idb, err := f.getDB(vars["device"])
 	if err != nil {
@@ -289,8 +290,19 @@ func (f *ecEngine) ecNurseryPutHandler(writer http.ResponseWriter, request *http
 	}
 }
 
-func (f *ecEngine) ecReconstructHandler(writer http.ResponseWriter, request *http.Request) {
+func (f *ecEngine) ecFakeHandler(writer http.ResponseWriter, request *http.Request) {
+	srv.GetLogger(request).Info("EC FAKE HANDLER!")
 	vars := srv.GetVars(request)
+	msg := fmt.Sprintf("VARS: %+v", vars)
+	srv.GetLogger(request).Info(msg)
+	srv.StandardResponse(writer, http.StatusOK)
+}
+
+func (f *ecEngine) ecReconstructHandler(writer http.ResponseWriter, request *http.Request) {
+	srv.GetLogger(request).Info("EC RECONSTRUCT HANDLER!")
+	vars := srv.GetVars(request)
+	msg := fmt.Sprintf("VARS: %+v", vars)
+	srv.GetLogger(request).Info(msg)
 	o, err := f.New(vars, false, nil)
 	if err != nil {
 		srv.GetLogger(request).Error("Unable to open object.", zap.Error(err))
@@ -308,9 +320,8 @@ func (f *ecEngine) ecReconstructHandler(writer http.ResponseWriter, request *htt
 		srv.GetLogger(request).Error("Unable to reconstruct.", zap.Error(err))
 		srv.StandardResponse(writer, http.StatusInternalServerError)
 		return
-	} else {
-		srv.StandardResponse(writer, http.StatusOK)
 	}
+	srv.StandardResponse(writer, http.StatusOK)
 }
 
 func (f *ecEngine) ecFragDeleteHandler(writer http.ResponseWriter, request *http.Request) {
@@ -457,7 +468,8 @@ func (f *ecEngine) RegisterHandlers(addRoute func(method, path string, handler h
 	addRoute("PUT", "/ec-frag/:device/:hash/:index", f.ecFragPutHandler)
 	addRoute("DELETE", "/ec-frag/:device/:hash/:index", f.ecFragDeleteHandler)
 	addRoute("GET", "/partition/:device/:partition", f.listPartitionHandler)
-	addRoute("PUT", "/ec-reconstruct/:device/:partition/:account/:container/*obj", f.ecReconstructHandler)
+	addRoute("PUT", "/ec-reconstruct/:device/:account/:container/*obj", f.ecReconstructHandler)
+	addRoute("GET", "/ec-fake/:device/:partition", f.ecFakeHandler)
 }
 
 func (f *ecEngine) GetNurseryObjects(device string, c chan ObjectStabilizer, cancel chan struct{}) {

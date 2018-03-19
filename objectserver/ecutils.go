@@ -3,9 +3,11 @@
 package objectserver
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/klauspost/reedsolomon"
+	"go.uber.org/zap"
 )
 
 func ecSplit(dataChunks, parityChunks int, fp io.Reader, chunkSize int, contentLength int64, writers []io.WriteCloser) error {
@@ -56,7 +58,9 @@ func ecSplit(dataChunks, parityChunks int, fp io.Reader, chunkSize int, contentL
 	return nil
 }
 
-func ecReconstruct(dataChunks, parityChunks int, bodies []io.Reader, chunkSize int, contentLength int64, dsts []io.Writer, dstChunkNum []int) error {
+func ecReconstruct(dataChunks, parityChunks int, bodies []io.Reader, chunkSize int, contentLength int64, dsts []io.Writer, dstChunkNum []int, logger *zap.Logger) error {
+	logger.Info(fmt.Sprintf("ecReconstruct, dsts: %+v", dsts))
+	logger.Info(fmt.Sprintf("ecReconstruct, dstChunkNum: %+v", dstChunkNum))
 	enc, err := reedsolomon.New(dataChunks, parityChunks)
 	if err != nil {
 		return err
@@ -110,6 +114,7 @@ func ecReconstruct(dataChunks, parityChunks int, bodies []io.Reader, chunkSize i
 			totalDatabytes += datalen
 		}
 	}
+	logger.Info("reconstructed totalDatabytes", zap.Int64("totalDatabytes", totalDatabytes))
 	return nil
 }
 
