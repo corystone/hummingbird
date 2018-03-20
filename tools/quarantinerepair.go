@@ -229,6 +229,7 @@ func (qr *quarantineRepair) repairHECObject(logger *zap.Logger, policy int, ring
 			logger.Error("repair HEC http.NewRequest", zap.Error(err))
 			continue
 		}
+		req.Header.Set("X-Backend-Storage-Policy-Index", fmt.Sprintf("%d", policy))
 		resp, err := qr.aa.client.Do(req)
 		if err != nil {
 			logger.Error("repair HEC client.Do", zap.Error(err))
@@ -441,6 +442,7 @@ func (qr *quarantineRepair) clearQuarantine(logger *zap.Logger, ipp *ippInstance
 	}
 	url := fmt.Sprintf("%s://%s:%d/", ipp.scheme, ipp.ip, ipp.port) + path.Join("recon", device, "quarantined", reconType, nameOnDevice)
 	logger = logger.With(zap.String("method", "DELETE"), zap.String("url", url))
+	logger.Info("CLEAR QUARANTINE")
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
 		logger.Error("http.NewRequest", zap.Error(err))
