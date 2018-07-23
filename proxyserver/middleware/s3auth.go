@@ -29,6 +29,34 @@ import (
 	"github.com/uber-go/tally"
 )
 
+var S3Subresources = map[string]bool{
+	"acl":                          true,
+	"delete":                       true,
+	"lifecycle":                    true,
+	"location":                     true,
+	"logging":                      true,
+	"notification":                 true,
+	"partNumber":                   true,
+	"policy":                       true,
+	"requestPayment":               true,
+	"torrent":                      true,
+	"uploads":                      true,
+	"uploadId":                     true,
+	"versionId":                    true,
+	"versioning":                   true,
+	"versions":                     true,
+	"website":                      true,
+	"response-cache-control":       true,
+	"response-content-disposition": true,
+	"response-content-encoding":    true,
+	"response-content-language":    true,
+	"response-content-type":        true,
+	"response-expires":             true,
+	"cors":                         true,
+	"tagging":                      true,
+	"restore":                      true,
+}
+
 type S3AuthInfo struct {
 	Key          string
 	Signature    string
@@ -125,9 +153,21 @@ func (s *s3AuthHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	buf.WriteString(request.URL.Path)
 	if request.URL.RawQuery != "" {
 		queryParts := strings.Split(request.URL.RawQuery, "&")
-		sort.Strings(queryParts)
-		buf.WriteString("?" + strings.Join(queryParts, "&"))
+		var signableQueryParts []string
+		for _, v := range queryParts {
+			if S3Subresources[v] {
+				signableQueryParts = append(signableQueryParts, v)
+			}
+		}
+		sort.Strings(signableQueryParts)
+		ctx.Logger.Info(fmt.Sprintf("queryParts: %+v", queryParts))
+		ctx.Logger.Info(fmt.Sprintf("signableQueryParts: %+v", signableQueryParts))
+		if len(signableQueryParts) > 0 {
+			buf.WriteString("?" + strings.Join(signableQueryParts, "&"))
+		}
 	}
+	ctx.Logger.Debug(fmt.Sprintf("%v", buf.String()))
+	ctx.Logger.Info(fmt.Sprintf("%v", buf.String()))
 	ctx.S3Auth = &S3AuthInfo{
 		StringToSign: buf.String(),
 		Key:          key,

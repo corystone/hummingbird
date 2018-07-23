@@ -145,7 +145,7 @@ func (server *ProxyServer) GetHandler(config conf.Config, metricsPrefix string) 
 			construct func(conf.Section, tally.Scope) (func(http.Handler) http.Handler, error)
 			section   string
 		}{
-			{middleware.NewCatchError, "filter:catch_errors"},
+			//			{middleware.NewCatchError, "filter:catch_errors"},
 			{middleware.NewHealthcheck, "filter:healthcheck"},
 			{middleware.NewRequestLogger, "filter:proxy-logging"},
 			{middleware.NewS3Auth, "filter:s3api"},
@@ -170,7 +170,7 @@ func (server *ProxyServer) GetHandler(config conf.Config, metricsPrefix string) 
 			construct func(conf.Section, tally.Scope) (func(http.Handler) http.Handler, error)
 			section   string
 		}{
-			{middleware.NewCatchError, "filter:catch_errors"},
+			//			{middleware.NewCatchError, "filter:catch_errors"},
 			{middleware.NewHealthcheck, "filter:healthcheck"},
 			{middleware.NewRequestLogger, "filter:proxy-logging"},
 			{middleware.NewS3Auth, "filter:s3api"},

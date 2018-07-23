@@ -49,8 +49,11 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/troubling/hummingbird/accountserver"
 	"github.com/troubling/hummingbird/common"
@@ -73,13 +76,17 @@ type s3Response struct {
 
 var s3Responses = map[int]s3Response{
 	// NOTE: These are meant to be generic responses
-	403: {"AccessDenied", "Access Denied"},
-	404: {"NotFound", "Not Found"}, // TODO: S3 responds with differetn 404 messages
-	405: {"MethodNotAllowed", "The specified method is not allowed against this resource."},
-	411: {"MissingContentLength", "You must provide the Content-Length HTTP header."},
-	500: {"InternalError", "We encountered an internal error. Please try again."},
-	501: {"NotImplemented", "A header you provided implies functionality that is not implemented."},
-	503: {"ServiceUnavailable", "Reduce your request rate."},
+	403:   {"AccessDenied", "Access Denied"},
+	404:   {"NotFound", "Not Found"}, // TODO: S3 responds with differetn 404 messages
+	405:   {"MethodNotAllowed", "The specified method is not allowed against this resource."},
+	411:   {"MissingContentLength", "You must provide the Content-Length HTTP header."},
+	500:   {"InternalError", "We encountered an internal error. Please try again."},
+	501:   {"NotImplemented", "A header you provided implies functionality that is not implemented."},
+	503:   {"ServiceUnavailable", "Reduce your request rate."},
+	40000: {"InvalidBucketName", "The specified bucket is not valid."},
+	40001: {"BucketAlreadyExists", "The specified bucket is not valid."},
+	40300: {"SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided."},
+	40400: {"NoSuchBucket", "The specified bucket does not exist."},
 }
 
 type s3Owner struct {
@@ -182,16 +189,20 @@ func NewS3BucketList() *s3BucketList {
 	return &s3BucketList{Xmlns: s3Xmlns}
 }
 
+type s3Prefix struct {
+	Prefix string `xml:"Prefix,omitempty"`
+}
+
 type s3ObjectInfo struct {
 	Name         string   `xml:"Key"`
 	LastModified string   `xml:"LastModified"`
 	ETag         string   `xml:"ETag"`
 	Size         int64    `xml:"Size"`
-	StorageClass string   `xml:"StorageClass"`
 	Owner        *s3Owner `xml:"Owner,omitempty"`
+	StorageClass string   `xml:"StorageClass"`
 }
 
-type s3ObjectList struct {
+type s3ObjectListV1 struct {
 	XMLName               xml.Name       `xml:"ListBucketResult"`
 	Xmlns                 string         `xml:"xmlns,attr"`
 	Name                  string         `xml:"Name"`
@@ -199,16 +210,92 @@ type s3ObjectList struct {
 	Marker                string         `xml:"Marker"`
 	NextMarker            string         `xml:"NextMarker"`
 	MaxKeys               int            `xml:"MaxKeys"`
+	Delimiter             string         `xml:"Delimiter"`
 	IsTruncated           bool           `xml:"IsTruncated"`
-	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string         `xml:"NextContinationToken,omitempty"`
-	StartAfter            string         `xml:"StartAfter,omitempty"`
-	KeyCount              string         `xml:"KeyCount,omitempty"`
 	Objects               []s3ObjectInfo `xml:"Contents"`
+	Prefixes              []s3Prefix     `xml:"CommonPrefixes,omitempty"`
 }
 
-func NewS3ObjectList() *s3ObjectList {
-	return &s3ObjectList{Xmlns: s3Xmlns}
+type s3ObjectListV2 struct {
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	Xmlns                 string         `xml:"xmlns,attr"`
+	Name                  string         `xml:"Name"`
+	Prefix                string         `xml:"Prefix"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
+	ContinuationToken     string         `xml:"ContinuationToken"`
+	StartAfter            string         `xml:"StartAfter,omitempty"`
+	KeyCount              string         `xml:"KeyCount,omitempty"`
+	MaxKeys               int            `xml:"MaxKeys"`
+	Delimiter             string         `xml:"Delimiter"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	Objects               []s3ObjectInfo `xml:"Contents"`
+	Prefixes              []s3Prefix     `xml:"CommonPrefixes,omitempty"`
+}
+
+type s3ObjectList interface {
+	SetName(val string)
+	SetPrefix(val string)
+	SetMarker(val string)
+	SetNextMarker(val string)
+	SetMaxKeys(val int)
+	SetDelimiter(val string)
+	SetIsTruncated(val bool)
+	SetNextContinuationToken(val string)
+	SetContinuationToken(val string)
+	SetStartAfter(val string)
+	SetKeyCount(val string)
+	GetObjects() []s3ObjectInfo
+	SetObjects(val []s3ObjectInfo)
+	GetPrefixes() []s3Prefix
+	SetPrefixes(val []s3Prefix)
+}
+
+func (l *s3ObjectListV1) SetName(val string) { l.Name = val }
+func (l *s3ObjectListV1) SetPrefix(val string) {l.Prefix = val }
+func (l *s3ObjectListV1) SetMarker(val string) {l.Marker = val }
+func (l *s3ObjectListV1) SetNextMarker(val string) {l.NextMarker = val }
+func (l *s3ObjectListV1) SetMaxKeys(val int) {l.MaxKeys = val }
+func (l *s3ObjectListV1) SetDelimiter(val string) {l.Delimiter = val }
+func (l *s3ObjectListV1) SetIsTruncated(val bool) {l.IsTruncated = val }
+func (l *s3ObjectListV1) SetNextContinuationToken(val string)  {}
+func (l *s3ObjectListV1) SetContinuationToken(val string) {}
+func (l *s3ObjectListV1) SetStartAfter(val string) {}
+func (l *s3ObjectListV1) SetKeyCount(val string) {}
+func (l *s3ObjectListV1) GetObjects() []s3ObjectInfo { return l.Objects }
+func (l *s3ObjectListV1) SetObjects(val []s3ObjectInfo) { l.Objects = val }
+func (l *s3ObjectListV1) GetPrefixes() []s3Prefix { return l.Prefixes }
+func (l *s3ObjectListV1) SetPrefixes(val []s3Prefix) { l.Prefixes = val }
+
+func (l *s3ObjectListV2) SetName(val string) { l.Name = val }
+func (l *s3ObjectListV2) SetPrefix(val string) {l.Prefix = val }
+func (l *s3ObjectListV2) SetMarker(val string) {}
+func (l *s3ObjectListV2) SetNextMarker(val string) {}
+func (l *s3ObjectListV2) SetMaxKeys(val int) {l.MaxKeys = val }
+func (l *s3ObjectListV2) SetDelimiter(val string) {l.Delimiter = val }
+func (l *s3ObjectListV2) SetIsTruncated(val bool) {l.IsTruncated = val }
+func (l *s3ObjectListV2) SetNextContinuationToken(val string) {l.NextContinuationToken = val }
+func (l *s3ObjectListV2) SetContinuationToken(val string) {l.ContinuationToken = val }
+func (l *s3ObjectListV2) SetStartAfter(val string) {l.StartAfter = val }
+func (l *s3ObjectListV2) SetKeyCount(val string) {l.KeyCount = val }
+func (l *s3ObjectListV2) GetObjects() []s3ObjectInfo { return l.Objects }
+func (l *s3ObjectListV2) SetObjects(val []s3ObjectInfo) { l.Objects = val }
+func (l *s3ObjectListV2) GetPrefixes() []s3Prefix { return l.Prefixes }
+func (l *s3ObjectListV2) SetPrefixes(val []s3Prefix) { l.Prefixes = val }
+
+func NewS3ObjectList(ver string) s3ObjectList {
+	if ver == "2" {
+		return &s3ObjectListV2{Xmlns: s3Xmlns}
+	}
+	return &s3ObjectListV1{Xmlns: s3Xmlns}
+}
+
+type ObjectListingRecord struct {
+	Name         string   `json:"name"`
+	LastModified string   `json:"last_modified"`
+	Size         int64    `json:"bytes"`
+	ContentType  string   `json:"content_type"`
+	ETag         string   `json:"hash"`
+	Subdir       string   `json:"subdir"`
 }
 
 type s3CopyObject struct {
@@ -254,6 +341,8 @@ func (w *s3ResponseWriterWrapper) Header() http.Header {
 }
 
 func (w *s3ResponseWriterWrapper) WriteHeader(statusCode int) {
+	w.writer.Header().Set("x-amz-id-2", w.requestId)
+	w.writer.Header().Set("x-amz-request-id", w.requestId)
 	if statusCode/100 != 2 {
 		// We are going to hijack to return an S3 style result
 		w.hijack = true
@@ -275,6 +364,9 @@ func (w *s3ResponseWriterWrapper) WriteHeader(statusCode int) {
 		headers.Set("Content-Type", "application/xml; charset=utf-8")
 		headers.Set("Content-Length", strconv.Itoa(len(output)))
 		w.msg = output
+	}
+	if statusCode > 1000 {
+		statusCode /= 100
 	}
 	w.writer.WriteHeader(statusCode)
 }
@@ -314,6 +406,66 @@ func s3PathSplit(path string) (string, string) {
 	}
 }
 
+func s3DateString(s string) string {
+	if strings.HasSuffix(s, "Z") {
+		s = s[:len(s)-1]
+	}
+	if len(s) < 3 {
+		return s
+	}
+	return s[:len(s)-3] + "Z"
+}
+
+func validBucketName(s string) bool {
+	if len(s) < 3 || len(s) > 63 {
+		return false
+	}
+	if !(unicode.IsLetter(rune(s[0])) || unicode.IsDigit(rune(s[0]))) {
+		return false
+	}
+	if strings.Index(s, ".-") != -1 {
+		return false
+	}
+	if strings.Index(s, "-.") != -1 {
+		return false
+	}
+	if strings.Index(s, "..") != -1 {
+		return false
+	}
+	if s[len(s)-1] == '.' {
+		return false
+	}
+	ip := regexp.MustCompile(`(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}`)
+	if ip.MatchString(s) {
+		return false
+	}
+	validChars := regexp.MustCompile(`^[-.a-z0-9]*$`)
+	if !validChars.MatchString(s) {
+		return false
+	}
+	return true
+}
+
+func NoSuchBucketResponse(writer http.ResponseWriter, request *http.Request) {
+	writer.WriteHeader(40400)
+	writer.Write(nil)
+}
+
+func SignatureDoesNotMatchResponse(writer http.ResponseWriter, request *http.Request) {
+	writer.WriteHeader(40300)
+	writer.Write(nil)
+}
+
+func InvalidBucketNameResponse(writer http.ResponseWriter, request *http.Request) {
+	writer.WriteHeader(40000)
+	writer.Write(nil)
+}
+
+func BucketAlreadyExistsResponse(writer http.ResponseWriter, request *http.Request) {
+	writer.WriteHeader(40001)
+	writer.Write(nil)
+}
+
 func (s *s3ApiHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	ctx := GetProxyContext(request)
 	// Check if this is an S3 request
@@ -325,6 +477,15 @@ func (s *s3ApiHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 
 	s.container, s.object = s3PathSplit(request.URL.Path)
 	s.account = ctx.S3Auth.Account
+
+	if s.container != "" {
+		if !validBucketName(s.container) {
+			InvalidBucketNameResponse(writer, request)
+			return
+		}
+	}
+
+	ctx.Logger.Info(fmt.Sprintf("AAAAAAAAAAAAAAAAAAUTH info: %+v", ctx.S3Auth))
 
 	// TODO: Validate the container
 	// Generate the hbird api path
@@ -647,6 +808,8 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 	ctx := GetProxyContext(request)
 	request.ParseForm()
 
+	writer.Header().Set("Location", "/"+s.container)
+
 	if request.Method == "HEAD" {
 		newReq, err := ctx.newSubrequest("HEAD", s.path, http.NoBody, request, "s3api")
 		if err != nil {
@@ -659,6 +822,8 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 			srv.StandardResponse(writer, cap.status)
 			return
 		} else {
+			writer.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			writer.Header().Set("Content-Length", "0")
 			writer.WriteHeader(200)
 			return
 		}
@@ -671,6 +836,10 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 		}
 		cap := NewCaptureWriter()
 		ctx.serveHTTPSubrequest(cap, newReq)
+		if cap.status == 404 {
+			NoSuchBucketResponse(writer, request)
+			return
+		}
 		if cap.status/100 != 2 {
 			srv.StandardResponse(writer, cap.status)
 			return
@@ -687,6 +856,11 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 		}
 		cap := NewCaptureWriter()
 		ctx.serveHTTPSubrequest(cap, newReq)
+		/* Can't overwrite a bucket in s3. */
+		if cap.status == http.StatusAccepted {
+			BucketAlreadyExistsResponse(writer, request)
+			return
+		}
 		if cap.status/100 != 2 {
 			srv.StandardResponse(writer, cap.status)
 			return
@@ -761,7 +935,7 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 		ver := q.Get("list-type")
 		marker := q.Get("marker")
 		prefix := q.Get("prefix")
-		delimeter := q.Get("delimeter")
+		delimiter := q.Get("delimiter")
 		fetchOwner := false
 		if ver == "2" {
 			marker = q.Get("start-after")
@@ -782,48 +956,60 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 		if prefix != "" {
 			nq.Set("prefix", prefix)
 		}
-		if delimeter != "" {
-			nq.Set("delimiter", delimeter)
+		if delimiter != "" {
+			nq.Set("delimiter", delimiter)
 		}
 		cap := NewCaptureWriter()
 		newReq.URL.RawQuery = nq.Encode()
+		ctx.Logger.Info(fmt.Sprintf("BUUUUUUUUSSSSTTTTEEEDD   path: %s, raw query: %s", s.path, newReq.URL.RawQuery))
 		ctx.serveHTTPSubrequest(cap, newReq)
+		if cap.status == 404 {
+			NoSuchBucketResponse(writer, request)
+			return
+		}
 		if cap.status/100 != 2 {
 			srv.StandardResponse(writer, cap.status)
 			return
 		}
-		objectListing := []containerserver.ObjectListingRecord{}
+		objectListing := []ObjectListingRecord{}
 		err = json.Unmarshal(cap.body, &objectListing)
 		if err != nil {
 			srv.SimpleErrorResponse(writer, http.StatusInternalServerError, err.Error())
 			return
 		}
 		truncated := maxKeys > 0 && len(objectListing) > maxKeys
+		next := ""
 		if len(objectListing) > maxKeys {
+			next = objectListing[maxKeys-1].Name
 			objectListing = objectListing[:maxKeys]
 		}
-		objectList := NewS3ObjectList()
-		objectList.Name = s.container
-		objectList.MaxKeys = maxKeys
-		objectList.IsTruncated = truncated
-		objectList.Marker = marker
-		objectList.Prefix = prefix
-		if ver == "2" {
-			if truncated {
-				objectList.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(objectListing[len(objectListing)].Name))
-			}
-			objectList.ContinuationToken = q.Get("continuation-token")
-			objectList.StartAfter = q.Get("start-after")
-			objectList.KeyCount = strconv.Itoa(len(objectListing))
-		} else {
-			if truncated && delimeter != "" {
-				objectList.NextMarker = objectListing[len(objectListing)].Name
+		ctx.Logger.Info(fmt.Sprintf("path: %s, raw query: %s", s.path, newReq.URL.RawQuery))
+		ctx.Logger.Info(fmt.Sprintf("listing: %s", cap.body))
+		objectList := NewS3ObjectList(ver)
+		objectList.SetName(s.container)
+		objectList.SetMaxKeys(maxKeys)
+		objectList.SetDelimiter(delimiter)
+		objectList.SetIsTruncated(truncated)
+		objectList.SetPrefix(prefix)
+		if truncated {
+			objectList.SetNextContinuationToken(base64.StdEncoding.EncodeToString([]byte(next)))
+			if delimiter != "" {
+				objectList.SetNextMarker(next)
 			}
 		}
+		objectList.SetContinuationToken(q.Get("continuation-token"))
+		objectList.SetStartAfter(q.Get("start-after"))
+		objectList.SetKeyCount(strconv.Itoa(len(objectListing)))
+		objectList.SetMarker(marker)
+		var prefixes []string
 		for _, o := range objectListing {
+			if o.Subdir != "" {
+				prefixes = append(prefixes, o.Subdir)
+				continue
+			}
 			obj := s3ObjectInfo{
 				Name:         o.Name,
-				LastModified: o.LastModified + "Z",
+				LastModified: s3DateString(o.LastModified),
 				ETag:         "\"" + o.ETag + "\"",
 				Size:         o.Size,
 				StorageClass: "STANDARD",
@@ -834,8 +1020,15 @@ func (s *s3ApiHandler) handleContainerRequest(writer http.ResponseWriter, reques
 					DisplayName: ctx.S3Auth.Account,
 				}
 			}
-			objectList.Objects = append(objectList.Objects, obj)
+			objectList.SetObjects(append(objectList.GetObjects(), obj))
 		}
+		if len(prefixes) > 0 {
+			sort.Strings(prefixes)
+			for _, prefix := range prefixes {
+				objectList.SetPrefixes(append(objectList.GetPrefixes(), s3Prefix{Prefix: prefix}))
+			}
+		}
+
 		output, err := xml.MarshalIndent(objectList, "", "  ")
 		if err != nil {
 			srv.SimpleErrorResponse(writer, http.StatusInternalServerError, err.Error())
@@ -914,7 +1107,7 @@ func NewS3Api(config conf.Section, metricsScope tally.Scope) (func(http.Handler)
 			})
 		}, nil
 	}
-	RegisterInfo("s3Api", map[string]interface{}{})
+	RegisterInfo("s3api", map[string]interface{}{})
 	return s3Api(metricsScope.Counter("s3Api_requests")), nil
 }
 

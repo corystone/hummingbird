@@ -349,6 +349,10 @@ func (server *ContainerServer) ContainerDeleteHandler(writer http.ResponseWriter
 		srv.StandardResponse(writer, http.StatusInternalServerError)
 		return
 	}
+	if info.DeleteTimestamp != "" && info.DeleteTimestamp > info.PutTimestamp {
+		srv.StandardResponse(writer, http.StatusNotFound)
+		return
+	}
 	if info.ObjectCount > 0 {
 		srv.StandardResponse(writer, http.StatusConflict)
 		return
